@@ -1,0 +1,11 @@
+# VPN クライアント設定（秘密鍵・証明書を含むため絶対に公開しない）
+*.ovpn
+wg0-*.conf
+
+# OS 生成ファイル
+.DS_Store
+Thumbs.db
+
+# エディタ設定
+.vscode/
+*.swp

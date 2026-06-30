@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  [5/5] Personal VPN server - monitoring & security stack
+  Resources:
+    - CloudTrail (API operation logs)
+    - GuardDuty (threat detection)
+    - Security Hub (security aggregation)
+    - SNS (email notification)
+    - CloudWatch Alarms (EC2 anomaly monitoring)
+    - AWS Budgets (cost-overrun alert)
+  * Compute Optimizer / Cost Optimization Hub are enabled manually in the AWS console (see the guide)
+  Deploy order: after the EC2 stack (needs the EC2 instance ID)
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: personal-vpn
+    Description: Project name (use the same value across all stacks)
+
+  AlertEmail:
+    Type: String
+    Description: |
+      Email address for alert notifications
+      ★ Enter your own email address
+      ★ A confirmation email arrives after deploy; click "Confirm subscription"
+    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Enter a valid email address
+
+  InstanceId:
+    Type: String
+    Description: |
+      EC2 instance ID
+      ★ Copy the "InstanceId" output of 04_ec2.yaml and paste it here
+      e.g., i-0123456789abcdef0
+    AllowedPattern: '^i-[a-f0-9]{8,17}$'
+    ConstraintDescription: Enter in i-xxxx format
+
+  MonthlyBudgetUSD:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 1000
+    Description: |
+      Monthly budget cap (USD)
+      An alert email is sent when actual cost reaches 80% of this amount.
+      This is a budget guardrail the operator sets freely (the default is just an example).
+      Actual charges vary by usage and price changes; confirm on each official pricing page.
+
+Resources:
+
+  # ============================================================
+  # SNS Topic (notification relay)
+  # ============================================================
+  # [What SNS is]
+  #   Simple Notification Service. A "relay hub" for notifications.
+  #   When a notification arrives from a CloudWatch Alarm, etc., it is
+  #   forwarded to the registered email address.
+  #
+  # [Flow]
+  #   CloudWatch Alarm fires → SNS Topic → email sent
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-alarm-topic
+      DisplayName: VPN server alert notifications
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Register the email address to the SNS topic (subscription)
+  # ★ After deploy, a confirmation email arrives at the registered address.
+  #    You MUST click the "Confirm subscription" link (otherwise no notifications arrive)
+  AlarmTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ============================================================
+  # CloudTrail (logs of all AWS API operations)
+  # ============================================================
+  # [What CloudTrail is]
+  #   A service that records "every operation" performed in the AWS account.
+  #   It records "who," "when," "which API," and "on which resource."
+  #   Essential for investigating the cause of a security incident.
+  #
+  # [Where logs are stored]
+  #   They must be stored in an S3 bucket.
+  #   The bucket needs a specific bucket policy (to allow CloudTrail writes).
+
+  # S3 bucket (for CloudTrail log storage)
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    # DeletionPolicy: Retain = keep the bucket even when the stack is deleted
+    # (a safeguard against accidentally deleting logs)
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-cloudtrail-${AWS::AccountId}
+      # Enable bucket versioning (helps prevent log tampering)
+      VersioningConfiguration:
+        Status: Enabled
+      # Lifecycle rule: auto-delete logs after 90 days (cost saving)
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      # Block all public access to the bucket itself
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Server-side encryption
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 bucket policy (allow CloudTrail to write logs)
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Permission for CloudTrail to check the bucket ACL
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          # Permission for CloudTrail to write log files
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # The CloudTrail trail itself
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy  # create after the bucket policy
+    Properties:
+      TrailName: !Sub ${ProjectName}-trail
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true                   # start logging
+      IncludeGlobalServiceEvents: true  # also record global services such as IAM
+      IsMultiRegionTrail: false         # current region only (fine for personal use)
+      EnableLogFileValidation: true     # enable log-file integrity validation
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================
+  # GuardDuty (threat detection)
+  # ============================================================
+  # [What GuardDuty is]
+  #   A service that uses machine learning to automatically detect threats to
+  #   the AWS account. It analyzes the following to find suspicious activity:
+  #   - CloudTrail logs (anomalous API operations)
+  #   - VPC Flow Logs (anomalous network traffic)
+  #   - DNS logs (e.g., malware C2 communication)
+  #
+  # Example: access to EC2 from an unknown country at midnight → alert
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      # FindingPublishingFrequency: the interval at which "recurring occurrences"
+      #   of an existing finding are aggregated and published to EventBridge/S3
+      #   (SIX_HOURS / ONE_HOUR / FIFTEEN_MINUTES).
+      #   * New findings (new IDs) are always published near real-time regardless.
+      #   * This setting does NOT affect GuardDuty pricing (billing is based on
+      #     the volume of data analyzed).
+      #     For personal use, set the longest interval (SIX_HOURS) to reduce noise.
+      FindingPublishingFrequency: SIX_HOURS
+
+  # ============================================================
+  # Security Hub (security aggregation dashboard)
+  # ============================================================
+  # [What Security Hub is]
+  #   A dashboard that aggregates security information from GuardDuty and others
+  #   in one place. It shows compliance against security standards (best-practice
+  #   sets) as a score.
+  #   * The set/name of standards enabled by default changes over time, so check
+  #     the latest behavior in the official AWS Security Hub documentation.
+  #
+  # ★ GuardDuty must be enabled first (ordering guaranteed via DependsOn)
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    DependsOn: GuardDutyDetector
+    Properties:
+      Tags:
+        Project: !Ref ProjectName
+
+  # ============================================================
+  # CloudWatch Alarms (EC2 monitoring alerts)
+  # ============================================================
+  # [What CloudWatch Alarms are]
+  #   A service that monitors metrics (such as CPU utilization) of EC2 and
+  #   notifies SNS when a threshold is crossed.
+  #
+  # Alarms configured here:
+  #   1. CPU utilization over 85% (sustained 5 minutes)
+  #   2. EC2 instance status check failure
+
+  # Alarm 1: high CPU utilization
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-cpu-high
+      AlarmDescription: |
+        The VPN server CPU utilization exceeded 85%.
+        Possible causes: VPN traffic overload, abnormal processing from malware, etc.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref InstanceId
+      Statistic: Average
+      Period: 300          # evaluate the 5-minute average
+      EvaluationPeriods: 2 # alarm after 2 consecutive breaches (avoids false positives)
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic  # also notify on recovery
+      TreatMissingData: notBreaching
+
+  # Alarm 2: EC2 status check failure
+  StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-status-check-failed
+      AlarmDescription: |
+        The VPN server status check failed.
+        There may be a problem with the EC2 instance or its host.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref InstanceId
+      Statistic: Maximum
+      Period: 60            # check every minute
+      EvaluationPeriods: 3  # alarm after 3 consecutive failures
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      TreatMissingData: breaching
+
+  # Alarm 3: spike in inbound network traffic
+  NetworkInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-network-in-high
+      AlarmDescription: |
+        Inbound network traffic to the VPN server spiked (over 500MB in 1 minute).
+        Possible DDoS attack or port scan.
+      Namespace: AWS/EC2
+      MetricName: NetworkIn
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref InstanceId
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 524288000   # 500MB = 500 * 1024 * 1024 bytes
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================
+  # AWS Budgets (monthly cost budget alert)
+  # ============================================================
+  # [What AWS Budgets is]
+  #   A service that monitors monthly AWS charges and warns of budget overruns.
+  #   It emails you when you reach 80% of the set amount.
+  #
+  # ★ Important: AWS charges can grow unexpectedly.
+  #   Always configure Budgets!
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${ProjectName}-monthly-budget
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUSD
+          Unit: USD
+      NotificationsWithSubscribers:
+        # Notify at 80% (to catch it early)
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        # Notify again at 100% (overrun confirmed)
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        # Notify in advance if the forecast for the month exceeds 100%
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+
+  AlarmTopicArn:
+    Description: SNS topic ARN (the alert notification relay)
+    Value: !Ref AlarmTopic
+
+  CloudTrailName:
+    Description: CloudTrail trail name
+    Value: !Sub ${ProjectName}-trail
+
+  CloudTrailBucketName:
+    Description: S3 bucket name for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+
+  GuardDutyDetectorId:
+    Description: GuardDuty detector ID
+    Value: !Ref GuardDutyDetector
+
+  Note:
+    Description: Services that must be enabled manually
+    Value: |
+      Enable the following services manually from the AWS console:
+      - Compute Optimizer: AWS console → Compute Optimizer → "Get started"
+      - Cost Optimization Hub: AWS console → Cost Optimization Hub → "Enable"
+      (Both are one-click in the console; no additional CLI commands needed.)

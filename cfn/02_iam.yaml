@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  [2/5] Personal VPN server - IAM stack
+  Resources: EC2 IAM role / instance profile (for SSM Session Manager access)
+  Deploy order: same time as or right after the VPC stack (no dependency)
+
+# ============================================================
+# What IAM (Identity and Access Management) is
+# ============================================================
+# IAM is AWS's "permission management system."
+# It finely controls "who" can perform "what" action on "which" resource.
+#
+# What we create here:
+#   IAM role: a "set of permissions" assigned to the EC2 instance
+#   Instance profile: the "container" that binds the IAM role to EC2
+#
+# Why an IAM role for SSM is needed:
+#   To connect to EC2 via SSM Session Manager, EC2 needs permission to
+#   "register its own information with the SSM service."
+#   That permission is granted as an IAM role.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: personal-vpn
+    Description: Project name (use the same value as the VPC stack)
+
+Resources:
+
+  # ----------------------------------------------------------
+  # IAM role for EC2 (required for SSM Session Manager access)
+  # ----------------------------------------------------------
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ec2-ssm-role
+      # [Trust policy]: defines "who" can use this role
+      # ec2.amazonaws.com = the EC2 service can assume this role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      # [Managed policy]: a permission set predefined by AWS
+      # AmazonSSMManagedInstanceCore: the minimum permissions for SSM Session Manager
+      #   - ssm:DescribeAssociation
+      #   - ssm:GetDocument
+      #   - ssmmessages:CreateControlChannel (for the SSM tunnel)
+      #   - ec2messages:AcknowledgeMessage (for SSM <-> EC2 communication)
+      #   etc.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ec2-ssm-role
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----------------------------------------------------------
+  # Instance profile
+  # ----------------------------------------------------------
+  # [What an instance profile is]
+  #   A "wrapper" for binding an IAM role to an EC2 instance.
+  #   You cannot attach an IAM role directly to EC2; it must always go
+  #   through an instance profile.
+  #   (The console hides this distinction, but a profile is created internally.)
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-ec2-profile
+      Roles:
+        - !Ref EC2SSMRole
+
+Outputs:
+
+  InstanceProfileName:
+    Description: EC2 instance profile name (enter into "InstanceProfileName" of 04_ec2.yaml)
+    Value: !Ref EC2InstanceProfile
+    Export:
+      Name: !Sub ${ProjectName}-InstanceProfileName
+
+  RoleArn:
+    Description: IAM role ARN (for reference)
+    Value: !GetAtt EC2SSMRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-RoleArn

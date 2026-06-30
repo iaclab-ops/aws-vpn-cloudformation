@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  [1/5] Personal VPN server - VPC stack
+  Resources: VPC, Internet Gateway, public subnet, route table
+  Deploy order: run first (other stacks use this stack's outputs)
+
+# ============================================================
+# Parameters: values you can review/change at deploy time
+# ============================================================
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: personal-vpn
+    Description: |
+      Project name. Used as the prefix for all resource names.
+      e.g., personal-vpn → personal-vpn-vpc, personal-vpn-subnet, etc.
+      * Use the same value across all stacks.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: |
+      The VPC's IP address range (CIDR).
+      10.0.0.0/16 = reserves 65,536 IP addresses.
+      No change needed for a personal VPN.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: |
+      The public subnet's IP address range.
+      10.0.1.0/24 = reserves 256 IP addresses.
+      No change needed for a personal VPN.
+
+  AvailabilityZone:
+    Type: String
+    Default: ap-northeast-1a
+    AllowedValues:
+      - ap-northeast-1a
+      - ap-northeast-1c
+      - ap-northeast-1d
+    Description: |
+      Availability Zone (AZ).
+      Choose an AZ in the Tokyo region (ap-northeast-1).
+      There are a/c/d. ap-northeast-1a is fine unless you have a reason otherwise.
+
+# ============================================================
+# Resource definitions
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # VPC (Virtual Private Cloud)
+  # ----------------------------------------------------------
+  # [What a VPC is]
+  #   Your own private virtual network inside the AWS cloud.
+  #   It is isolated from other AWS users and is a safe space that
+  #   cannot be accessed directly from the internet.
+  #   Resources such as EC2 live inside the VPC.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true      # enable DNS resolution for EC2 instances
+      EnableDnsHostnames: true    # assign public DNS names to EC2 instances
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----------------------------------------------------------
+  # Internet Gateway (IGW)
+  # ----------------------------------------------------------
+  # [What an IGW is]
+  #   The "doorway" that lets resources in the VPC (such as EC2)
+  #   communicate with the internet.
+  #   Without it, EC2 in the VPC cannot reach the internet.
+  #   Only one can be attached per VPC.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-igw
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # "Attach" the IGW to the VPC (creating it alone does nothing)
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ----------------------------------------------------------
+  # Public subnet
+  # ----------------------------------------------------------
+  # [What a subnet is]
+  #   A "smaller room" that further divides the VPC.
+  #   Public subnet: a subnet that can communicate with the internet (where EC2 goes)
+  #   Private subnet: a subnet with no direct internet communication (not needed here)
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false  # auto-assign OFF because a static IP is managed via Elastic IP
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-subnet
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: Public
+
+  # ----------------------------------------------------------
+  # Route table
+  # ----------------------------------------------------------
+  # [What a route table is]
+  #   A table that defines "where to forward a packet based on its destination"
+  #   (like road signs).
+  #   e.g., "destined for the internet (0.0.0.0/0)" → "send via the IGW"
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-rt
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route to the internet (0.0.0.0/0 = all destinations → via IGW)
+  # DependsOn: create the route only after the IGW is attached to the VPC (ordering)
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate the route table with the subnet
+  # (this association is what makes the subnet a "public subnet")
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+# ============================================================
+# Outputs: export values used by other stacks
+# ============================================================
+# [How to use]
+#   After deploying this stack, view these on the AWS console "Outputs" tab.
+#   Copy these values when entering parameters for the next stacks (IAM, Security, EC2).
+Outputs:
+
+  VpcId:
+    Description: VPC ID (enter into the "VpcId" parameter of 03_security.yaml)
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${ProjectName}-VpcId
+
+  PublicSubnetId:
+    Description: Public subnet ID (enter into the "SubnetId" parameter of 04_ec2.yaml)
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${ProjectName}-PublicSubnetId
+
+  VpcCidr:
+    Description: VPC CIDR block (referenced during WireGuard setup)
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub ${ProjectName}-VpcCidr

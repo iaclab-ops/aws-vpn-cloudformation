@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  [3/5] Personal VPN server - Security Group stack
+  Resources: Security Group for the VPN server
+  Deploy order: after the VPC stack (needs the VPC ID)
+
+# ============================================================
+# What a Security Group is
+# ============================================================
+# AWS's "virtual firewall." It controls traffic at the instance level
+# (distinct from VPC-level NACLs).
+#
+# Policy here (least privilege):
+#   Inbound (outside → EC2): allow only WireGuard (UDP 51820) and OpenVPN (TCP 443)
+#   Outbound (EC2 → outside): allow all (needed to relay VPN traffic)
+#   SSH (port 22): not allowed (unnecessary; replaced by SSM Session Manager)
+#
+# * Why SSH is not opened:
+#   An exposed SSH port is an easy target for brute-force attacks.
+#   SSM Session Manager is a safe way to reach EC2 without SSH.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: personal-vpn
+    Description: Project name (use the same value across all stacks)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: |
+      VPC ID
+      ★ After deploying 01_vpc.yaml, copy the "VpcId" value from the Outputs tab and paste it here
+      e.g., vpc-0123456789abcdef0
+
+Resources:
+
+  # ----------------------------------------------------------
+  # Security Group for the VPN server
+  # ----------------------------------------------------------
+  VpnSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-vpn-sg
+      GroupDescription: VPN server SG - allow only WireGuard (UDP 51820) and OpenVPN (TCP 443)
+      VpcId: !Ref VpcId
+
+      # ============================================================
+      # Inbound rules (outside → EC2)
+      # ============================================================
+      SecurityGroupIngress:
+
+        # WireGuard VPN
+        # UDP 51820: WireGuard's standard port
+        # CidrIp: 0.0.0.0/0 = connectable from anywhere (required for a VPN server)
+        - IpProtocol: udp
+          FromPort: 51820
+          ToPort: 51820
+          CidrIp: 0.0.0.0/0
+          Description: WireGuard VPN (UDP 51820)
+
+        # OpenVPN (over TLS)
+        # TCP 443: same port as HTTPS; tends to pass through where UDP is blocked
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: OpenVPN over TLS (TCP 443) - same port as HTTPS, passes most firewalls
+
+        # Allow IPv6 as well (e.g., for connections from phones)
+        - IpProtocol: udp
+          FromPort: 51820
+          ToPort: 51820
+          CidrIpv6: ::/0
+          Description: WireGuard VPN IPv6 (UDP 51820)
+
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: OpenVPN over TLS IPv6 (TCP 443)
+
+      # ============================================================
+      # Outbound rules (EC2 → outside)
+      # ============================================================
+      SecurityGroupEgress:
+
+        # IPv4: allow all
+        # -1 = all protocols
+        # Required to relay VPN client traffic to the internet
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (required to relay VPN client traffic)
+
+        # IPv6: allow all
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+          Description: Allow all outbound traffic IPv6
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpn-sg
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+
+  SecurityGroupId:
+    Description: Security Group ID (enter into "SecurityGroupId" of 04_ec2.yaml)
+    Value: !Ref VpnSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-SecurityGroupId
+
+  SecurityGroupName:
+    Description: Security Group name (for reference)
+    Value: !Sub ${ProjectName}-vpn-sg

@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  [4/5] Personal VPN server - EC2 stack
+  Resources: EC2 instance (Amazon Linux 2023 ARM64)
+  * The Elastic IP is not created new; an existing IP (issued by the old Terraform
+    version) is reused by passing it via the ExistingEipAllocationId parameter.
+  Deploy order: after the VPC / IAM / Security Group stacks
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: personal-vpn
+    Description: Project name (use the same value across all stacks)
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: |
+      Public subnet ID
+      ★ Copy the "PublicSubnetId" output of 01_vpc.yaml and paste it here
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: |
+      Security Group ID
+      ★ Copy the "SecurityGroupId" output of 03_security.yaml and paste it here
+
+  InstanceProfileName:
+    Type: String
+    Description: |
+      IAM instance profile name
+      ★ Copy the "InstanceProfileName" output of 02_iam.yaml and paste it here
+
+  InstanceType:
+    Type: String
+    Default: t4g.nano
+    AllowedValues:
+      - t4g.nano
+      - t4g.micro
+      - t4g.small
+    Description: |
+      EC2 instance type
+      t4g family = ARM-based (Graviton2). Lower cost than equivalent x86.
+      t4g.nano is sufficient for a personal VPN.
+
+  # ============================================================
+  # Auto-fetch AMI (latest Amazon Linux 2023)
+  # ============================================================
+  # [Key point]
+  #   By specifying Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>,
+  #   CloudFormation auto-fetches the latest AMI ID from SSM Parameter Store
+  #   at deploy time. No need to look up the AMI ID manually!
+  #
+  #   /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  #   = the path to the latest Amazon Linux 2023 ARM64 AMI
+  LatestAl2023AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Latest Amazon Linux 2023 AMI (auto-fetched; no change needed)
+
+  # ============================================================
+  # Parameters for reusing an existing Elastic IP
+  # ============================================================
+  # [Why reuse an existing IP instead of creating a new one]
+  #   The Elastic IP (<YOUR-ELASTIC-IP>) issued by the old Terraform version is
+  #   already configured on the VPN client side, so we do not want to change it.
+  #   Creating a new EIP would change the address, so we reassign the existing
+  #   EIP to this EC2 instead.
+  ExistingEipAllocationId:
+    Type: String
+    AllowedPattern: '^eipalloc-[a-f0-9]{8,17}$'
+    ConstraintDescription: Enter in eipalloc-xxxx format
+    Description: |
+      Allocation ID of the existing Elastic IP to reuse
+      ★ Find it in AWS console → EC2 → "Elastic IPs"
+      e.g., eipalloc-0123456789abcdef0
+
+  ExistingEipAddress:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    ConstraintDescription: Enter in IPv4 address format
+    Description: |
+      IP address of the existing Elastic IP to reuse (for output reference)
+      ★ Enter the address of the same Elastic IP as ExistingEipAllocationId
+      e.g., <YOUR-ELASTIC-IP>
+
+Resources:
+
+  # ----------------------------------------------------------
+  # EC2 instance (the VPN server itself)
+  # ----------------------------------------------------------
+  VpnServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAl2023AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      IamInstanceProfile: !Ref InstanceProfileName
+
+      # [EBS optimization]: the t4g family is EBS-optimized by default
+      # Root volume settings
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20          # GB (20GB is enough for WireGuard + OpenVPN + logs)
+            VolumeType: gp3         # gp3 = latest-generation general-purpose SSD
+            Encrypted: true         # encrypt the EBS volume (security hardening)
+            DeleteOnTermination: true
+
+      # ============================================================
+      # UserData: setup script run automatically when EC2 boots
+      # ============================================================
+      # [What UserData is]
+      #   A shell script that runs at first boot of EC2 (once only).
+      #   It automates software installation and configuration.
+      #   Execution logs are in /var/log/cloud-init-output.log on the EC2.
+      #
+      # [About !Sub and Fn::Base64]
+      #   Fn::Base64: Base64-encode the script and pass it to EC2 (AWS requirement)
+      #   !Sub: expand parameters such as ${ProjectName} inside the script
+      #
+      # [Note] Write shell variables as $varname (CFn would try to interpret ${varname})
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            # ============================================================
+            # VPN server setup script (Amazon Linux 2023)
+            # Execution log: /var/log/cloud-init-output.log
+            # ============================================================
+            set -e   # stop immediately on error
+            set -x   # log executed commands (for debugging)
+
+            PROJECT="${ProjectName}"
+            LOG_FILE="/var/log/vpn-setup.log"
+
+            echo "=== VPN Server Setup Start ===" | tee $LOG_FILE
+            echo "Timestamp: $(date)" | tee -a $LOG_FILE
+            echo "Project: $PROJECT" | tee -a $LOG_FILE
+
+            # ----------------------------------------------------------
+            # 1. Update system packages
+            # ----------------------------------------------------------
+            # dnf: the package manager for Amazon Linux 2023 / RHEL family
+            # (equivalent to apt on Ubuntu)
+            dnf update -y
+
+            # ----------------------------------------------------------
+            # 2. Install required packages
+            # ----------------------------------------------------------
+            # wireguard-tools: WireGuard VPN command-line tools
+            # fail2ban: brute-force (password-guessing) protection
+            # firewalld: host firewall (AL2023 default; equivalent to ufw on Ubuntu)
+            # qrencode: generate WireGuard QR codes (simplifies phone setup)
+            # jq: JSON processing tool
+            # * We do NOT explicitly install curl.
+            #   AL2023 ships curl-minimal by default, and this script's
+            #   `curl -fsSL` (for downloading EasyRSA) works with it.
+            #   Trying to install full curl conflicts with curl-minimal, so
+            #   `dnf install -y` fails -> set -e stops the whole script
+            #   (note: this curl-minimal conflict was observed during deployment).
+            dnf install -y \
+              wireguard-tools \
+              fail2ban \
+              firewalld \
+              qrencode \
+              jq
+
+            # Install OpenVPN (try from the AL2023 standard repo)
+            if dnf install -y openvpn; then
+              echo "OpenVPN installed from standard repo" | tee -a $LOG_FILE
+            else
+              echo "OpenVPN not in standard repo - will be installed manually" | tee -a $LOG_FILE
+              echo "See: docs/wireguard_openvpn_setup.md for manual installation steps"
+            fi
+
+            # easy-rsa (OpenVPN certificate management tool)
+            if dnf install -y easy-rsa; then
+              echo "easy-rsa installed from standard repo" | tee -a $LOG_FILE
+            else
+              # Fallback: download directly from GitHub
+              EASYRSA_VER="3.1.7"
+              echo "Installing easy-rsa $EASYRSA_VER from GitHub..." | tee -a $LOG_FILE
+              curl -fsSL \
+                "https://github.com/OpenVPN/easy-rsa/releases/download/v$EASYRSA_VER/EasyRSA-$EASYRSA_VER.tgz" \
+                -o /tmp/easyrsa.tgz
+              tar xzf /tmp/easyrsa.tgz -C /opt/
+              ln -sf /opt/EasyRSA-$EASYRSA_VER/easyrsa /usr/local/bin/easyrsa
+              chmod +x /usr/local/bin/easyrsa
+              echo "easy-rsa $EASYRSA_VER installed from GitHub" | tee -a $LOG_FILE
+            fi
+
+            # ----------------------------------------------------------
+            # 3. Confirm SSM Agent (pre-installed on Amazon Linux 2023)
+            # ----------------------------------------------------------
+            # SSM Agent: the daemon EC2 uses to talk to AWS Systems Manager
+            # It is pre-installed, so we just confirm and start it
+            systemctl enable --now amazon-ssm-agent
+            SSM_STATUS=$(systemctl is-active amazon-ssm-agent)
+            echo "SSM Agent status: $SSM_STATUS" | tee -a $LOG_FILE
+
+            # ----------------------------------------------------------
+            # 4. Enable IP forwarding
+            # ----------------------------------------------------------
+            # A VPN server "relays" client packets to the internet.
+            # The Linux kernel must be configured to allow packet forwarding.
+            cat >> /etc/sysctl.conf << 'SYSCTL_EOF'
+            # VPN packet forwarding (added by CloudFormation user_data)
+            net.ipv4.ip_forward=1
+            net.ipv6.conf.all.forwarding=1
+            SYSCTL_EOF
+            sysctl -p
+
+            # ----------------------------------------------------------
+            # 5. firewalld configuration (host firewall)
+            # ----------------------------------------------------------
+            # firewalld: the default firewall management tool on AL2023
+            # It manages rules using the concept of "zones"
+            systemctl enable --now firewalld
+
+            # Explicitly register the default NIC in the public zone.
+            # On AL2023 the NetworkManager integration may not work, leaving
+            # --get-active-zones empty. Specify explicitly to register reliably.
+            NIC=$(ip route show default | awk '{print $5}')
+            firewall-cmd --zone=public --add-interface=$NIC --permanent
+
+            # Allow the WireGuard port
+            firewall-cmd --permanent --add-port=51820/udp
+
+            # Allow the OpenVPN port
+            firewall-cmd --permanent --add-port=443/tcp
+
+            # Enable masquerade (NAT)
+            # Needed so VPN client packets are sent out with EC2's IP address
+            firewall-cmd --permanent --add-masquerade
+
+            # Allow inter-interface forwarding (needed for wg0 -> ens5 routing)
+            # Without this, packets do not reach POSTROUTING even with MASQUERADE
+            firewall-cmd --permanent --add-forward
+
+            # Apply the rules
+            firewall-cmd --reload
+
+            FIREWALL_STATUS=$(firewall-cmd --state)
+            echo "firewalld status: $FIREWALL_STATUS" | tee -a $LOG_FILE
+
+            # ----------------------------------------------------------
+            # 6. fail2ban configuration (intrusion protection)
+            # ----------------------------------------------------------
+            # fail2ban watches logs and bans IPs that fail a set number of times.
+            # /var/log/secure: AL2023's SSH auth log (equiv. to /var/log/auth.log on Ubuntu)
+            cat > /etc/fail2ban/jail.local << 'FAIL2BAN_EOF'
+            [DEFAULT]
+            bantime  = 3600
+            findtime = 600
+            maxretry = 3
+            ignoreip = 127.0.0.1/8 ::1
+
+            [sshd]
+            enabled  = true
+            port     = ssh
+            logpath  = /var/log/secure
+            maxretry = 3
+            FAIL2BAN_EOF
+
+            systemctl enable --now fail2ban
+            echo "fail2ban status: $(systemctl is-active fail2ban)" | tee -a $LOG_FILE
+
+            # ----------------------------------------------------------
+            # 7. Automatic security updates
+            # ----------------------------------------------------------
+            # dnf-automatic: a tool that auto-applies security patches
+            dnf install -y dnf-automatic
+
+            # Auto-apply security updates only (do not apply all updates)
+            sed -i 's/upgrade_type = default/upgrade_type = security/' /etc/dnf/automatic.conf
+            sed -i 's/apply_updates = no/apply_updates = yes/' /etc/dnf/automatic.conf
+
+            # Enable the timer (default: runs once a day)
+            systemctl enable --now dnf-automatic.timer
+
+            # ----------------------------------------------------------
+            # 8. Completion log
+            # ----------------------------------------------------------
+            echo "" | tee -a $LOG_FILE
+            echo "=== Setup Summary ===" | tee -a $LOG_FILE
+            echo "Completed at: $(date)" | tee -a $LOG_FILE
+            echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2)" | tee -a $LOG_FILE
+            echo "Kernel: $(uname -r)" | tee -a $LOG_FILE
+            echo "SSM Agent: $(systemctl is-active amazon-ssm-agent)" | tee -a $LOG_FILE
+            echo "firewalld: $(systemctl is-active firewalld)" | tee -a $LOG_FILE
+            echo "fail2ban: $(systemctl is-active fail2ban)" | tee -a $LOG_FILE
+            echo "WireGuard: $(wg --version)" | tee -a $LOG_FILE
+            echo "=== Setup Complete ===" | tee -a $LOG_FILE
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpn-server
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----------------------------------------------------------
+  # Elastic IP association (reuse an existing IP, not a new one)
+  # ----------------------------------------------------------
+  # [Why we do not create an AWS::EC2::EIP resource]
+  #   We want to keep using the Elastic IP (<YOUR-ELASTIC-IP>) already issued by
+  #   the old Terraform version. Creating a new EIP would change the address and
+  #   force reconfiguring every VPN client.
+  #
+  #   So we receive the Allocation ID of the "existing EIP" as a parameter and
+  #   simply reassign it to the newly created EC2 via AWS::EC2::EIPAssociation
+  #   (we do not create or delete the EIP itself).
+  #
+  # [Pricing]
+  #   Since February 2024, AWS charges hourly for "all public IPv4 addresses,
+  #   whether in use or not." An EIP associated with a running EC2 is billable,
+  #   and an unused (unassociated) EIP is billable as before.
+  #   → For cost control, do not keep spare EIPs (release ones you do not use).
+  #   * Exact rates and free tiers change, so confirm on the official pricing page.
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref VpnServer
+      AllocationId: !Ref ExistingEipAllocationId
+
+Outputs:
+
+  InstanceId:
+    Description: EC2 instance ID (enter into "InstanceId" of 05_monitoring.yaml)
+    Value: !Ref VpnServer
+    Export:
+      Name: !Sub ${ProjectName}-InstanceId
+
+  PublicIp:
+    Description: |
+      The VPN server's static IP address (important!)
+      ★ Use this IP in the WireGuard/OpenVPN client configs
+      * Since the existing Elastic IP is reused as-is, this simply outputs the
+        value of the ExistingEipAddress parameter you entered
+    Value: !Ref ExistingEipAddress
+    Export:
+      Name: !Sub ${ProjectName}-PublicIp
+
+  PrivateIp:
+    Description: EC2 private IP address (used in VPN internal config)
+    Value: !GetAtt VpnServer.PrivateIp
+    Export:
+      Name: !Sub ${ProjectName}-PrivateIp
+
+  AvailabilityZone:
+    Description: The Availability Zone the EC2 launched in
+    Value: !GetAtt VpnServer.AvailabilityZone
